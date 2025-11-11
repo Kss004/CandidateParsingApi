@@ -41,7 +41,7 @@ app = FastAPI(
 class ParseRequest(BaseModel):
     prompt: str = Field(
         ...,
-        examples=["Show me an experienced MERN full stack lead from IIT Bombay."],
+        examples=["Write query here."],
     )
 
 
