@@ -104,7 +104,7 @@ def build_json_prompt(user_prompt: str) -> str:
     # Keep your structure but be very explicit about no extra tokens.
     return (
         "<|system|>\n"
-        "You are a strict JSON data extractor for candidate requirements.\n"
+        "You are a expert JSON data extractor for candidate requirements.\n"
         "\n"
         "Rules for SKILL extraction:\n"
         "- Always extract ALL skills mentioned directly or implicitly.\n"
