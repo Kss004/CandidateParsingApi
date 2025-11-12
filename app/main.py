@@ -104,7 +104,7 @@ def build_json_prompt(user_prompt: str) -> str:
     # Keep your structure but be very explicit about no extra tokens.
     return (
         "<|system|>\n"
-        "You are a expert JSON data extractor for candidate requirements.\n"
+        "You are an expert JSON data extractor for candidate requirements.\n"
         "\n"
         "Rules for SKILL extraction:\n"
         "- Always extract ALL skills mentioned directly or implicitly.\n"
@@ -120,7 +120,18 @@ def build_json_prompt(user_prompt: str) -> str:
         "  'would be nice', 'preferred', 'bonus', 'plus' → classify as optional.\n"
         "- Extract **only the skill keyword**, not the entire sentence.\n"
         "\n"
-        "DO NOT invent skills that are not explicitly mentioned.\n"
+        "Rules for EXPERIENCE extraction:\n"
+        "- Look for keywords: 'fresher', 'fresh graduate', 'entry level', 'junior',\n"
+        "  'experienced', 'senior', 'lead', 'principal', 'staff', 'veteran'.\n"
+        "- Experience level mapping:\n"
+        "  * Fresher/Fresh graduate/Entry level/Junior → {\"min\": 0, \"max\": 2}\n"
+        "  * Experienced/Mid-level → {\"min\": 2, \"max\": 5}\n"
+        "  * Senior/Lead/Principal → {\"min\": 5, \"max\": 10}\n"
+        "  * Staff/Veteran/Expert → {\"min\": 10, \"max\": null}\n"
+        "- If specific years mentioned (e.g., '3-5 years', '5+ years'), use those exact values.\n"
+        "- If no experience mentioned, leave as {\"min\": null, \"max\": null}.\n"
+        "\n"
+        "DO NOT invent skills or data that are not explicitly mentioned.\n"
         "Return strictly valid JSON.\n"
         "<|end|>\n"
         "<|user|>\n"
@@ -253,7 +264,7 @@ def parse_model_output(raw_output: str) -> dict:
 
     # 3) Parse; if it fails once, try a second pass with extra hardening
     try:
-        return json.loads(repaired)
+        parsed = json.loads(repaired)
     except json.JSONDecodeError:
         logger.error(
             "Failed to parse JSON after repair (first attempt): %s", repaired[:500])
@@ -264,12 +275,22 @@ def parse_model_output(raw_output: str) -> dict:
             r"([{\[,]\s*)[A-Za-z_][A-Za-z0-9_]*\s*(?=\s*\")", r"\1", repaired)
 
         try:
-            return json.loads(hardened)
+            parsed = json.loads(hardened)
         except json.JSONDecodeError as exc:
             logger.error(
                 "Failed to parse JSON after hardening: %s", hardened[:500])
             raise ValueError(
                 "Model output could not be parsed as JSON.") from exc
+
+    # 4) Normalize null lists to empty lists for Pydantic validation
+    if "data" in parsed and isinstance(parsed["data"], dict):
+        data = parsed["data"]
+        # Convert null to empty list for list fields
+        for field in ["skills", "optionalSkills", "instituteName", "course"]:
+            if field in data and data[field] is None:
+                data[field] = []
+
+    return parsed
 
 
 # -------------------- FastAPI Routes --------------------
