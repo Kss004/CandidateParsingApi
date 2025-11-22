@@ -1,9 +1,6 @@
 """
 HR-Only Chat API - ChatGPT-style conversational interface for HR tasks
 
-This is a conversational API similar to ChatGPT/OpenAI, but restricted to HR tasks only.
-Users can ask questions, request JD creation, rank candidates, parse resumes, etc.
-The model responds in natural language, not just structured JSON.
 
 Supported HR tasks:
 - Job description creation
@@ -34,7 +31,12 @@ from datetime import datetime, timedelta
 import PyPDF2
 import docx
 import io
+import docx
+import io
 import json
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 # --------------------------- Configuration ---------------------------
 MODEL_REPO = os.getenv("MODEL_REPO", "bartowski/Qwen2.5-7B-Instruct-GGUF")
@@ -60,9 +62,7 @@ NON_HR_KEYWORDS = [
     "docker", "kubernetes", "how to build", "install", "math problem", "physics",
     "legal advice", "contract law", "tax advice", "chemistry", "exploit", "hack",
     "malware", "bomb", "weapon", "cryptocurrency trading", "blockchain development",
-    "medical diagnosis", "financial investment", "stock trading",
-    "porn", "sex", "erotic", "rocket", "missile", "capital of", "ignore all previous",
-    "ignore previous", "system prompt", "jailbreak"
+    "medical diagnosis", "financial investment", "stock trading"
 ]
 
 # --------------------------- App Setup ---------------------------
@@ -125,6 +125,33 @@ class ChatCompletionStructuredResponse(BaseModel):
     model: str
     usage: Dict[str, int]
     response: Dict[str, Any]
+
+
+class ScoreBreakdown(BaseModel):
+    skillsMatch: int
+    experienceRelevance: int
+    educationAlignment: int
+    embeddingSimilarity: float
+
+
+class CandidateScoreDetailed(BaseModel):
+    name: str
+    filename: str
+    overallScore: int
+    fitCategory: str  # "Top Fit", "Good Fit", "Potential Fit", "Not Fit"
+    breakdown: ScoreBreakdown
+    matchedSkills: List[str]
+    missingSkills: List[str]
+    reasoning: str
+
+
+class RankingResponseDetailed(BaseModel):
+    jobDescription: str
+    summaryScore: float
+    candidates: List[CandidateScoreDetailed]
+    userId: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
 
 # --------------------------- Rate Limiter ---------------------------
 
@@ -311,17 +338,17 @@ def is_hr_related(text: str) -> bool:
 
     low = text.lower()
 
-    # 1. Check for non-HR keywords (Blocklist) - Priority
-    if contains_non_hr_content(text):
-        return False
-
-    # 2. Check for HR keywords (Allowlist)
+    # Check for HR keywords
     for keyword in hr_keywords:
         if keyword in low:
             return True
 
-    # 3. Default: Reject if no HR keywords found (Strict Mode)
-    return False
+    # If no HR keywords and contains non-HR keywords, reject
+    if contains_non_hr_content(text):
+        return False
+
+    # Default: allow if ambiguous (can be tuned)
+    return True
 
 # --------------------------- System Prompt ---------------------------
 
@@ -339,7 +366,7 @@ HR_SYSTEM_PROMPT = """You are an expert HR Assistant AI. You help with all HR-re
 - Helping with onboarding and training
 - Any other HR and recruitment tasks
 
-You ONLY handle HR-related queries. If a user asks about non-HR topics (like coding tutorials, math problems, legal advice, medical questions, etc.), politely decline and remind them you only assist with HR tasks.
+You ONLY handle HR-related queries. If a user asks about non-HR topics (like coding tutorials, math problems, legal advice, medical questions,stocks, investing, etc.), politely decline and remind them you only assist with HR tasks.
 
 Be professional, helpful, and conversational. Provide detailed, actionable responses."""
 
@@ -353,7 +380,34 @@ class HRChatModel:
         self.model = None
         self.model_lock = asyncio.Lock()
         self.inference_semaphore = asyncio.Semaphore(INFERENCE_CONCURRENCY)
+        self.embedding_model = None
         logger.info("HRChatModel initialized.")
+
+    def _load_embedding_model(self) -> None:
+        """Load the sentence transformer model for embeddings."""
+        if self.embedding_model is not None:
+            return
+        
+        logger.info("Loading embedding model all-MiniLM-L6-v2...")
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        logger.info("Embedding model loaded.")
+
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Generate embedding for text."""
+        if self.embedding_model is None:
+            self._load_embedding_model()
+        return self.embedding_model.encode(text)
+
+    def calculate_similarity(self, text1: str, text2: str) -> float:
+        """Calculate cosine similarity between two texts."""
+        emb1 = self.get_embedding(text1)
+        emb2 = self.get_embedding(text2)
+        
+        # Reshape for sklearn
+        emb1 = emb1.reshape(1, -1)
+        emb2 = emb2.reshape(1, -1)
+        
+        return float(cosine_similarity(emb1, emb2)[0][0])
 
     def _load_model(self) -> None:
         if self.model is not None:
@@ -385,6 +439,8 @@ class HRChatModel:
         async with self.model_lock:
             if self.model is None:
                 await asyncio.to_thread(self._load_model)
+            if self.embedding_model is None:
+                await asyncio.to_thread(self._load_embedding_model)
 
     def _build_prompt(self, messages: List[Message]) -> str:
         """Build prompt from message history using Qwen 2.5 format."""
@@ -621,10 +677,20 @@ Return ONLY valid JSON in the exact format above. Do not include markdown format
 
             # Try to parse JSON
             parsed = parse_json_safe(response_text)
+            
+            # Handle the case where the model returns a raw string "HR_SCOPE_VIOLATION"
+            # which parse_json_safe might return as a string if it was quoted, or None if not.
             if not parsed:
-                final_error = "Unable to parse JSON from model output"
-                logger.warning("Parse failure on attempt %d", attempt)
-                continue
+                if "HR_SCOPE_VIOLATION" in response_text:
+                    parsed = {"data": "HR_SCOPE_VIOLATION", "type": "error"}
+                else:
+                    final_error = "Unable to parse JSON from model output"
+                    logger.warning("Parse failure on attempt %d. Output: %s", attempt, response_text[:100])
+                    continue
+
+            # If parsed is just the string "HR_SCOPE_VIOLATION", wrap it
+            if isinstance(parsed, str) and "HR_SCOPE_VIOLATION" in parsed:
+                parsed = {"data": "HR_SCOPE_VIOLATION", "type": "error"}
 
             # Validate structure
             if not isinstance(parsed, dict) or "data" not in parsed or "type" not in parsed:
@@ -1245,8 +1311,154 @@ Return ONLY valid JSON, no additional text."""
         response=parsed
     )
 
+
+@app.post("/v1/rank-candidates", response_model=RankingResponseDetailed)
+async def rank_candidates_endpoint(
+    files: List[UploadFile] = File(...),
+    jobDescription: str = Form(...),
+    criteria: Optional[str] = Form(None)
+):
+    """
+    Rank multiple candidates against a Job Description using Hybrid approach (Embeddings + LLM).
+    
+    Upload multiple resume files (PDF/DOCX/TXT) and provide a JD.
+    The system will evaluate each resume and return a ranked list with detailed breakdown.
+    """
+    candidates = []
+    
+    # Process each file
+    for file in files:
+        try:
+            # Read and extract text
+            content = await file.read()
+            resume_text = extract_text_from_file(file.filename, content)
+            
+            if not resume_text or len(resume_text.strip()) < 50:
+                logger.warning(f"Skipping empty file: {file.filename}")
+                continue
+            
+            # 1. Calculate Semantic Similarity (Embedding)
+            similarity_score = await asyncio.to_thread(
+                chat_model.calculate_similarity, jobDescription, resume_text[:2000]
+            )
+            similarity_percent = int(similarity_score * 100)
+            
+            # 2. Build prompt with semantic context
+            prompt = f"""Evaluate this resume against the Job Description.
+            
+Job Description:
+{jobDescription}
+
+{f'Additional Criteria: {criteria}' if criteria else ''}
+
+Resume Content:
+{resume_text[:3500]}
+
+Semantic Match Score (Calculated by Embedding Model): {similarity_score:.2f} ({similarity_percent}%)
+
+Task:
+1. Analyze the resume against the JD.
+2. Provide a detailed score breakdown (0-100) for Skills, Experience, and Education.
+3. Determine the overall fit category (Top Fit, Good Fit, Potential Fit, Not Fit).
+4. List matched and missing skills.
+5. Provide a reasoning.
+
+Return ONLY valid JSON in this format:
+{{
+  "data": {{
+    "name": "Candidate Name",
+    "overallScore": 85,
+    "fitCategory": "Top Fit",
+    "breakdown": {{
+      "skillsMatch": 90,
+      "experienceRelevance": 80,
+      "educationAlignment": 70,
+      "embeddingSimilarity": {similarity_score:.2f}
+    }},
+    "matchedSkills": ["Skill1", "Skill2"],
+    "missingSkills": ["Skill3"],
+    "reasoning": "Detailed explanation..."
+  }},
+  "type": "object"
+}}"""
+
+            # Generate evaluation
+            messages = [Message(role="user", content=prompt)]
+            
+            # We process sequentially
+            response_text = await chat_model.generate(messages, 0.1, 1024)
+            
+            # Parse response
+            parsed = parse_json_safe(response_text)
+            
+            if parsed and "data" in parsed and isinstance(parsed["data"], dict):
+                data = parsed["data"]
+                candidates.append(CandidateScoreDetailed(
+                    name=data.get("name", "Unknown"),
+                    filename=file.filename,
+                    overallScore=data.get("overallScore", 0),
+                    fitCategory=data.get("fitCategory", "Potential Fit"),
+                    breakdown=ScoreBreakdown(**data.get("breakdown", {
+                        "skillsMatch": 0, "experienceRelevance": 0, 
+                        "educationAlignment": 0, "embeddingSimilarity": similarity_score
+                    })),
+                    matchedSkills=data.get("matchedSkills", []),
+                    missingSkills=data.get("missingSkills", []),
+                    reasoning=data.get("reasoning", "No reasoning provided")
+                ))
+            else:
+                logger.warning(f"Failed to parse score for {file.filename}")
+                # Fallback for parse error
+                candidates.append(CandidateScoreDetailed(
+                    name="Parse Error",
+                    filename=file.filename,
+                    overallScore=0,
+                    fitCategory="Not Fit",
+                    breakdown=ScoreBreakdown(
+                        skillsMatch=0, experienceRelevance=0, 
+                        educationAlignment=0, embeddingSimilarity=similarity_score
+                    ),
+                    matchedSkills=[],
+                    missingSkills=[],
+                    reasoning="Failed to parse model response"
+                ))
+                
+        except Exception as e:
+            logger.error(f"Error processing {file.filename}: {e}")
+            # Fallback for exception
+            candidates.append(CandidateScoreDetailed(
+                name="Error",
+                filename=file.filename,
+                overallScore=0,
+                fitCategory="Not Fit",
+                breakdown=ScoreBreakdown(
+                    skillsMatch=0, experienceRelevance=0, 
+                    educationAlignment=0, embeddingSimilarity=0.0
+                ),
+                matchedSkills=[],
+                missingSkills=[],
+                reasoning=f"Processing error: {str(e)}"
+            ))
+
+    # Sort by overallScore descending
+    candidates.sort(key=lambda x: x.overallScore, reverse=True)
+    
+    # Calculate summary score (average of top 3 or all)
+    if candidates:
+        avg_score = sum(c.overallScore for c in candidates) / len(candidates)
+    else:
+        avg_score = 0.0
+    
+    return RankingResponseDetailed(
+        jobDescription=jobDescription[:100] + "...",
+        summaryScore=round(avg_score, 1),
+        candidates=candidates
+    )
+
+
 # CLI Runner
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main3:app", host="0.0.0.0", port=8002, reload=True)
+
